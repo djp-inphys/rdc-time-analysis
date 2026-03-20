@@ -1,0 +1,13 @@
+{
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.autopep8"
+    },
+    "python.formatting.provider": "none",
+    "cmake.configureOnOpen": false,
+    "terminal.integrated.profiles.windows": {
+        "cmd": {
+            "path": "C:\\Windows\\System32\\cmd.exe",
+            "args": ["/K", "D:\\ProgramData\\miniconda3\\Scripts\\activate.bat", "D:\\ProgramData\\miniconda3"]
+        }
+    }
+}

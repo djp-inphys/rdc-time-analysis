@@ -1,0 +1,2 @@
+D560 seemingly died around half way through the second round of temperature readings. I will note that the battery
+voltage readings were lower than the rest, so maybe its got a bad battery?
