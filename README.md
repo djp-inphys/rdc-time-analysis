@@ -305,4 +305,4 @@ Detailed technical reports are included in the project root:
 | B003 | Dec 29, 2025 | |
 | B004 | Dec 29, 2025 | |
 | B005 | Dec 29, 2025 | |
-| B006 | 2016 | Legacy very high dose rate testing (alternate CSV format) |
+| B006 | 2016 | Wrong date 2026 very high dose rate testing (alternate CSV format) |
