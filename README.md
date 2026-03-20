@@ -102,11 +102,30 @@ rdc-time-analysis/
 
 Using three features derived from tick-collision data, devices are clustered into three health classes:
 
-| Class | Description |
-|---|---|
-| **Failing** | High timeout ratio, right-tail skewness, poor IQR stability |
-| **At-Risk** | Borderline performance on one or more metrics |
-| **Healthy** | Stable timing, low dropout rate |
+| Class | Devices | Description |
+|---|---|---|
+| **Failing** | CB100-2600577, CB100-2598385, CB100-2599429 | High timeout ratio, right-tail skewness, poor IQR stability |
+| **At-Risk** | CB100-2595836 | Borderline performance on one or more metrics |
+| **Healthy** | All remaining devices | Stable timing, low dropout rate |
+
+Each device is scored on three features computed from its inter-arrival times (the millisecond gap between consecutive received packets):
+
+#### Feature A — Timeout Ratio
+The **fraction of inter-arrival intervals that exceed 250 ms**. Because healthy devices report at ~200 ms, any interval longer than 250 ms represents a packet that arrived noticeably late — a sign the BLE stack was stalled. Failing devices have a markedly higher proportion of these delayed packets than healthy ones.
+
+> `timeout_ratio = (intervals > 250ms).mean()`
+
+#### Feature B — Skewness
+The **statistical skewness of the inter-arrival time distribution**. A healthy device produces a tight, roughly symmetric distribution centred near 200 ms. A problematic device accumulates a long right-hand tail (occasional very large gaps), which drives positive skewness. High positive skew indicates that while most packets arrive on time, a non-trivial number are severely delayed.
+
+> `skew = intervals.skew()`
+
+#### Feature C — Stability Index (IQR)
+The **interquartile range (IQR = Q75 − Q25)** of inter-arrival times, measuring the tightness of the device's "heartbeat". A small IQR means the device reports at a very consistent cadence. A large IQR means the gap between packets varies widely, which correlates with unreliable BLE connectivity even when timeouts are not yet occurring.
+
+> `iqr = intervals.quantile(0.75) − intervals.quantile(0.25)`
+
+Together, a device with a **high Timeout Ratio**, **high Skewness**, and **high IQR** sits in a distinct region of the 3D feature space, separating Failing and At-Risk devices from Healthy ones at a glance in `device_health_3d.html`.
 
 ---
 
