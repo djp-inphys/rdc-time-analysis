@@ -1,0 +1,56 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Large raw-capture files ──────────────────────────────────────────────────
+# These can be hundreds of MB – store separately (e.g. shared drive / LFS)
+rdc-captures/
+
+# ── Generated / derived data ─────────────────────────────────────────────────
+session_exports/
+gap_exports/
+parsed_cache/
+old/
+
+# ── Large individual generated CSVs ─────────────────────────────────────────
+collision_exports/all_collision_ticks_W49ms.csv
+collision_exports/all_collision_ticks_W49ms*.csv
+
+# ── Generated plots directory ────────────────────────────────────────────────
+# Root-level summary PNGs are small enough to keep; the per-device plots/ dir is not
+plots/
+
+# ── Large HTML output files ───────────────────────────────────────────────────
+device_health_3d.html
+old_device_health_3d.html
+
+# ── Binary pickle / cache files ──────────────────────────────────────────────
+*.pkl
+*.pkl.gz
+
+# ── Jupyter / IDE ────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+.jupyter/
+
+# ── OS / editor artefacts ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/

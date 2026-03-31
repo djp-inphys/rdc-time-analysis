@@ -18,6 +18,7 @@ A scientific data analysis project investigating the **timing reliability and BL
 - [Setup & Requirements](#setup--requirements)
 - [Usage](#usage)
 - [Documentation](#documentation)
+- [Batch Data Summary](#batch-data-summary)
 
 ---
 
@@ -43,12 +44,16 @@ rdc-time-analysis/
 ├── thermal_drift.py               # Thermal clock drift analysis script
 ├── dropout_gaps.py                # BLE dropout / gap detection script
 ├── health-check.py                # 3D device health clustering visualisation
-├── eda-2.0.py                     # Legacy monolithic EDA script (reference only)
+├── eda-2.0.py                     # Monolithic EDA + collision analysis pipeline
+├── preparse_txt_logs.py           # Standalone log pre-parser and cache builder
 │
-├── B001/ – B006/                  # Raw batch log files (input data)
-│   ├── Batch*.txt                 #   BLE log files produced by CB100_BLE.py
-│   ├── dose_XXXXXXX-v1.0.csv      #   Per-device dose calibration tables
-│   └── Note*.txt                  #   Field notes (where present)
+├── rdc-captures/                  # Raw .txt log files (all formats)
+│   ├── Batch*.txt                 #   Short-duration batch captures (CB100_BLE.py)
+│   ├── LongTimeOverNight_*.txt    #   Multi-hour overnight captures (CSV timestamp format)
+│   └── WeekendCapture_*.txt       #   Extended weekend stress-test captures
+│
+├── parsed_cache/                  # Auto-created binary cache (gitignored)
+│   └── parsed_readings.pkl.gz     #   Gzip-compressed DataFrame from preparse_txt_logs.py
 │
 ├── session_exports/               # Parsed per-device session CSVs
 ├── gap_exports/                   # Dropout gap CSVs (per-device + combined)
@@ -155,21 +160,84 @@ Primary script for clock drift investigation. Outputs:
 
 Detects intra-file dropout events above a configurable threshold. Supports both auto-detection and loading of curated `real-gaps/` CSVs for ground-truth comparison.
 
-### `health-check.py` — 3D Device Health
+### `health-check.py` — 3D Device Health (collision-based)
 
 Loads `collision_exports/all_collision_ticks_W49ms.csv`, computes per-device health features (Timeout Ratio, Right-Tail Skewness, IQR Stability Index), and renders an interactive Plotly 3D scatter chart. Output saved as `device_health_3d.html`.
 
-### `eda-2.0.py` — Legacy Monolithic Script
+### `plt_test.py` — Per-device Timing Distribution Analysis
 
-Predecessor to the split architecture above. Contains the same analysis logic in a single file. Kept for reference; not recommended for new work.
+Loads all `session_exports/all_device_*.csv` files and computes health-discriminating features directly from raw inter-sample times on **both** the device clock and the host clock.  Does not depend on the collision pipeline.
+
+The script addresses a key limitation of `health-check.py`: the old fixed 250 ms timeout threshold misclassifies newer devices whose nominal transmission period is ~258 ms.  Here an **adaptive threshold** (1.25 × per-device median) is used, so devices with different nominal periods are judged on the same relative scale.
+
+**Clock sync:** Before comparing inter-sample intervals the per-session median offset between the device clock and host clock is subtracted, removing timezone and epoch biases and leaving only genuine jitter.
+
+**Outputs:**
+
+| File | Contents |
+|---|---|
+| `device_timing_histograms.png` | Grid: device-clock Δt, host-clock Δt, residual lag jitter — one column per device |
+| `device_timing_features.csv` | Per-device distribution statistics (median, IQR, skew, adaptive timeout ratio, lag jitter std) |
+| `device_health_features.png` | 2-D scatter: IQR vs Skew, Timeout Ratio vs IQR, Timeout Ratio vs Lag Jitter — all coloured by health status |
+
+**CLI arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--session-dir` | `session_exports` | Directory containing `all_device_*.csv` files |
+| `--output-dir` | `.` | Where to write PNG and CSV outputs |
+| `--max-gap-ms` | `1000` | Discard inter-sample gaps larger than this (ms); excludes session-boundary jumps from Δt histograms |
+| `--session-split-s` | `5` | Device-clock gap (seconds) that marks a new monitoring-session boundary within a source file; each segment gets its own independent clock-sync offset so overnight multi-session files no longer pollute residual lag with day-scale drift |
+| `--timeout-factor` | `1.25` | Adaptive timeout threshold as a multiple of each device's own median inter-sample time |
+| `--no-plots` | `False` | Skip all matplotlib output; write features CSV only |
+| `--log-level` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `--log-file` | — | Optional path to mirror log output to a file |
+
+### `eda-2.0.py` — Monolithic EDA & Collision Analysis Pipeline
+
+Full analysis pipeline in a single script. Parses raw `.txt` logs (or loads a pre-built binary cache via `--parsed-binary-path`), computes per-device session statistics, detects dropout gaps, and optionally runs the tick-collision analysis that produces `collision_exports/all_collision_ticks_W49ms.csv`.
+
+Key CLI arguments:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--parsed-binary-path` | `parsed_cache/parsed_by_device.pkl.gz` | Load from binary cache instead of re-parsing `.txt` files |
+| `--rebuild-parsed-binary` | `False` | Force re-parse even when cache exists |
+| `--build-parsed-binary-only` | `False` | Write cache then exit without running analysis |
+| `--collision-analysis` | `False` | Enable tick-collision export |
+| `--collision-intra-gap-ms` | `1000` | Max intra-session gap (ms); larger gaps split active segments |
+| `--real-gaps-dir` | — | Directory of curated ground-truth gap CSVs |
+
+### `preparse_txt_logs.py` — Standalone Log Pre-Parser
+
+Parses all CB100 `.txt` log files **once**, writes a gzip-compressed binary cache, and displays interactive per-file diagnostic plots.  Run this first before `eda-2.0.py` to dramatically reduce repeated parse times on large overnight captures.
+
+Key CLI arguments:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--root` | `.` | Root directory to search |
+| `--pattern` | `rdc-captures/*.txt` | Glob pattern for log file discovery |
+| `--output-binary` | `parsed_cache/parsed_readings.pkl.gz` | Path for the binary cache output |
+| `--plot-files` | `*` | Comma-separated glob patterns selecting files to plot; `''` skips all plots |
+| `--max-gap-ms` | `10000` | Histogram x-axis clip (ms) — does not affect stored data |
+| `--log-level` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `--log-file` | — | Optional path to mirror log output to a file |
+
+The generated cache is a `pandas.DataFrame` persisted with `df.to_pickle(..., compression='gzip')` and can be reloaded directly:
+
+```python
+import pandas as pd
+df = pd.read_pickle("parsed_cache/parsed_readings.pkl.gz", compression="gzip")
+```
 
 ---
 
 ## Data Format
 
-### Input: Batch Log Files (`B001/Batch*.txt`)
+### Input: Batch Log Files (`rdc-captures/Batch*.txt`)
 
-Plain-text files produced by `CB100_BLE.py`. Two line types:
+Plain-text files produced by `CB100_BLE.py`.  Lines use a `[HH:MM:SS.mmm]` bracket prefix:
 
 ```
 # Sensor reading
@@ -179,7 +247,31 @@ Plain-text files produced by `CB100_BLE.py`. Two line types:
 [13:23:16.906] DATA_LOSS_DETECTED: CB100-2599429 - 13606s jump detected
 ```
 
-B006 additionally contains a legacy CSV variant (2016 high-dose-rate testing) with `Timestamp,Message` columns.
+### Input: Overnight / Weekend Log Files (`rdc-captures/LongTimeOverNight_*.txt`, `WeekendCapture_*.txt`)
+
+Produced by a newer logger variant.  Lines use a CSV prefix (`HH:MM:SS.mmm,`) rather than brackets:
+
+```
+Timestamp,Message
+17:01:11.575,CB100-2597625--> TS: 1774368070.079 | Pulse: 0 | Charge: 6 | ADC: 0 | ...
+```
+
+Both formats are handled transparently by `preparse_txt_logs.py` and `eda-2.0.py`.
+
+### Binary Cache (`parsed_cache/parsed_readings.pkl.gz`)
+
+Compressed `pandas.DataFrame` written by `preparse_txt_logs.py`:
+
+| Column | Type | Description |
+|---|---|---|
+| `source_file` | str | Basename of originating `.txt` log |
+| `device_uid` | str | Device identifier (e.g. `CB100-2597625`) |
+| `captured_at` | datetime | Device-side timestamp (from TS field) |
+| `log_time` | datetime / NaT | Host-PC reception timestamp (NaT if not parseable) |
+| `pulse_count` | int | Pulse counter value |
+| `charge_count` | int | Integrated charge counter |
+| `adc_value` | int | Raw ADC reading (0 when not reported) |
+| `inter_sample_ms` | float | Gap (ms) to previous reading for same device in same file; NaN for first reading |
 
 ### Input: Dose Calibration (`B00X/dose_XXXXXXX-v1.0.csv`)
 
@@ -205,11 +297,14 @@ Two-column files mapping charge counts to dose values. Twenty files across five 
 
 | Directory | Contents |
 |---|---|
-| `session_exports/` | Parsed readings per device (20 CSVs) |
+| `session_exports/` | Parsed readings per device (23 CSVs) |
 | `gap_exports/` | Dropout gaps per device + combined (9 CSVs) |
 | `thermal_exports/` | Drift summary, per-bin Δt stats, significance tables, drift rate by temp bin |
 | `collision_exports/` | Tick collision timing data |
 | `real-gaps/` | Curated ground-truth gap CSVs for 4 problem devices |
+| `device_timing_histograms.png` | Per-device histogram grid (from `plt_test.py`) |
+| `device_timing_features.csv` | Per-device distribution features (from `plt_test.py`) |
+| `device_health_features.png` | 2-D health feature scatter plots (from `plt_test.py`) |
 
 Key thermal export files:
 
@@ -293,13 +388,95 @@ python dropout_gaps.py \
   --gap-csv-dir gap_exports
 ```
 
-### Device Health Visualisation
+### Pre-parse Log Files (recommended first step)
+
+Build the binary cache for all captures and display diagnostic plots for all files:
+
+```bash
+python preparse_txt_logs.py
+```
+
+Limit plots to overnight files only:
+
+```bash
+python preparse_txt_logs.py --plot-files "LongTimeOverNight*,WeekendCapture*"
+```
+
+Build cache without any plots (fastest):
+
+```bash
+python preparse_txt_logs.py --plot-files ""
+```
+
+Custom root / pattern / output:
+
+```bash
+python preparse_txt_logs.py \
+  --root . \
+  --pattern "rdc-captures/*.txt" \
+  --output-binary parsed_cache/parsed_readings.pkl.gz \
+  --max-gap-ms 5000 \
+  --log-level DEBUG \
+  --log-file preparse.log
+```
+
+### EDA & Collision Analysis (`eda-2.0.py`)
+
+Basic run (re-parses txt files):
+
+```bash
+python eda-2.0.py
+```
+
+Use the binary cache to skip parsing:
+
+```bash
+python eda-2.0.py --parsed-binary-path parsed_cache/parsed_readings.pkl.gz
+```
+
+Rebuild cache and run collision analysis:
+
+```bash
+python eda-2.0.py \
+  --rebuild-parsed-binary \
+  --collision-analysis \
+  --collision-intra-gap-ms 1000
+```
+
+### Device Health Visualisation (collision-based, 3D)
 
 ```bash
 python health-check.py
 ```
 
 Opens an interactive 3D Plotly chart in your browser and saves `device_health_3d.html`.
+
+### Per-device Timing Distribution Analysis
+
+Run the full analysis (histograms + feature scatter plots + CSV):
+
+```bash
+python plt_test.py
+```
+
+Features CSV only (no plots, fastest):
+
+```bash
+python plt_test.py --no-plots
+```
+
+Custom session directory and output location:
+
+```bash
+python plt_test.py \
+  --session-dir session_exports \
+  --output-dir analysis_results \
+  --max-gap-ms 1000 \
+  --session-split-s 5 \
+  --timeout-factor 1.25 \
+  --log-level INFO \
+  --log-file plt_test.log
+```
 
 ---
 

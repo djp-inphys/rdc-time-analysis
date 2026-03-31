@@ -15,7 +15,9 @@ This file remains for backwards reference, but new work should use the split scr
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
+import pickle
 import re
 import sys
 from dataclasses import dataclass, field
@@ -41,6 +43,7 @@ REGEX_READING = re.compile(
     re.IGNORECASE,
 )
 REGEX_BRACKET_TIME = re.compile(r"\[(?P<hms>\d{2}:\d{2}:\d{2}\.\d{3})\]")
+REGEX_CSV_TIME = re.compile(r"^(?P<hms>\d{2}:\d{2}:\d{2}\.\d{3}),")
 REGEX_TEMP_HEADER = re.compile(r"Temperature Information from\s+(CB100-\d+)\s*:", re.IGNORECASE)
 REGEX_AMBIENT_TEMP = re.compile(r"Ambient Temperature:\s*([+-]?\d+(?:\.\d+)?)\s*°?C", re.IGNORECASE)
 REGEX_DATE_IN_NAME = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
@@ -191,7 +194,7 @@ class LogParser:
         """Generator replacement returning sorted list."""
         candidates = []
         for p in self.root.glob(self.pattern):
-            if p.is_file() and p.suffix.lower() == ".txt" and "batch" in p.name.lower():
+            if p.is_file() and p.suffix.lower() == ".txt":
                 candidates.append(p)
         return sorted(candidates, key=lambda p: str(p).lower())
 
@@ -398,8 +401,10 @@ class LogParser:
 
     @staticmethod
     def _parse_bracket_time(line: str, base_date: datetime) -> Optional[datetime]:
-        """Parses [HH:MM:SS.mmm] and combines with base_date."""
+        """Parses [HH:MM:SS.mmm] or CSV-format HH:MM:SS.mmm, and combines with base_date."""
         m = REGEX_BRACKET_TIME.search(line)
+        if not m:
+            m = REGEX_CSV_TIME.match(line)
         if not m:
             return None
         try:
@@ -407,6 +412,85 @@ class LogParser:
             return base_date.replace(hour=t.hour, minute=t.minute, second=t.second, microsecond=t.microsecond)
         except ValueError:
             return None
+
+
+class ParsedBinaryStore:
+    """Persist parsed log records in a compressed binary cache grouped by device."""
+
+    VERSION = 1
+
+    @staticmethod
+    def group_by_device(
+        raw_readings: List[Dict[str, Any]],
+        raw_temps: List[Dict[str, Any]],
+        raw_events: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+        grouped: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+
+        def _ensure(uid: str) -> Dict[str, List[Dict[str, Any]]]:
+            if uid not in grouped:
+                grouped[uid] = {"readings": [], "temps": [], "events": []}
+            return grouped[uid]
+
+        for row in raw_readings:
+            uid = str(row.get("device_uid", "UNKNOWN"))
+            _ensure(uid)["readings"].append(row)
+        for row in raw_temps:
+            uid = str(row.get("device_uid", "UNKNOWN"))
+            _ensure(uid)["temps"].append(row)
+        for row in raw_events:
+            uid = str(row.get("device_uid", "UNKNOWN"))
+            _ensure(uid)["events"].append(row)
+
+        return grouped
+
+    @staticmethod
+    def flatten_grouped(
+        grouped: Dict[str, Dict[str, List[Dict[str, Any]]]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        readings: List[Dict[str, Any]] = []
+        temps: List[Dict[str, Any]] = []
+        events: List[Dict[str, Any]] = []
+        for uid in sorted(grouped.keys()):
+            bucket = grouped[uid]
+            readings.extend(bucket.get("readings", []))
+            temps.extend(bucket.get("temps", []))
+            events.extend(bucket.get("events", []))
+        return readings, temps, events
+
+    @classmethod
+    def save(
+        cls,
+        path: Path,
+        *,
+        root: Path,
+        pattern: str,
+        grouped: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": cls.VERSION,
+            "created_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
+            "root": str(root),
+            "pattern": str(pattern),
+            "grouped_by_device": grouped,
+        }
+        with gzip.open(path, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def load(
+        cls, path: Path
+    ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+        with gzip.open(path, "rb") as f:
+            payload = pickle.load(f)
+        version = int(payload.get("version", -1))
+        if version != cls.VERSION:
+            raise ValueError(f"Unsupported parsed cache version: {version}")
+        grouped = payload.get("grouped_by_device")
+        if not isinstance(grouped, dict):
+            raise ValueError("Invalid parsed cache format: missing grouped_by_device")
+        return grouped
 
 
 class DataProcessor:
@@ -843,6 +927,366 @@ class ChartPlotter:
             self.logger.error("Failed to save plot %s: %s", name, e)
 
 
+# --- Collision Analysis Helpers ---
+
+def load_real_gaps(real_gaps_dir: Path) -> pd.DataFrame:
+    """
+    Load curated gap CSVs from `real_gaps_dir`.
+
+    Expected columns (minimum):
+      - device_uid
+      - source_file
+      - prev_captured_at
+      - captured_at
+      - delta_ms
+    """
+    if real_gaps_dir is None:
+        return pd.DataFrame()
+    try:
+        files = sorted([p for p in Path(real_gaps_dir).glob("*.csv") if p.is_file()], key=lambda p: p.name.lower())
+    except Exception:
+        return pd.DataFrame()
+    if not files:
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    for p in files:
+        try:
+            df = pd.read_csv(p)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        required = {"device_uid", "source_file", "prev_captured_at", "captured_at", "delta_ms"}
+        if not required.issubset(set(df.columns)):
+            continue
+        out = df[list(required)].copy()
+        out["device_uid"] = out["device_uid"].astype(str)
+        out["source_file"] = out["source_file"].astype(str)
+        out["prev_captured_at"] = pd.to_datetime(out["prev_captured_at"], errors="coerce")
+        out["captured_at"] = pd.to_datetime(out["captured_at"], errors="coerce")
+        out["delta_ms"] = pd.to_numeric(out["delta_ms"], errors="coerce")
+        out = out.dropna(subset=["device_uid", "source_file", "prev_captured_at", "captured_at", "delta_ms"])
+        if not out.empty:
+            frames.append(out)
+
+    if not frames:
+        return pd.DataFrame()
+    allg = pd.concat(frames, ignore_index=True)
+    return allg.sort_values(["source_file", "device_uid", "captured_at"], kind="mergesort").reset_index(drop=True)
+
+
+def map_gaps_to_log_time(gaps_df: pd.DataFrame, readings_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map curated gaps (defined by device `captured_at`) onto receiver time (`log_time`)
+    by joining to readings_df on (source_file, device_uid, captured_at).
+    """
+    if gaps_df.empty or readings_df.empty:
+        return pd.DataFrame()
+    required_g = {"source_file", "device_uid", "prev_captured_at", "captured_at", "delta_ms"}
+    required_r = {"source_file", "device_uid", "captured_at", "log_time"}
+    if not required_g.issubset(set(gaps_df.columns)) or not required_r.issubset(set(readings_df.columns)):
+        return pd.DataFrame()
+
+    g = gaps_df.copy()
+    g["prev_captured_at"] = pd.to_datetime(g["prev_captured_at"], errors="coerce")
+    g["captured_at"] = pd.to_datetime(g["captured_at"], errors="coerce")
+    g["delta_ms"] = pd.to_numeric(g["delta_ms"], errors="coerce")
+    g = g.dropna(subset=["source_file", "device_uid", "prev_captured_at", "captured_at", "delta_ms"])
+    if g.empty:
+        return pd.DataFrame()
+
+    r = readings_df[["source_file", "device_uid", "captured_at", "log_time"]].copy()
+    r["captured_at"] = pd.to_datetime(r["captured_at"], errors="coerce")
+    r["log_time"] = pd.to_datetime(r["log_time"], errors="coerce")
+    r = r.dropna(subset=["source_file", "device_uid", "captured_at", "log_time"])
+    if r.empty:
+        return pd.DataFrame()
+
+    r["captured_ns"] = r["captured_at"].astype("int64")
+    r = r.drop_duplicates(subset=["source_file", "device_uid", "captured_ns"], keep="first")
+
+    g["prev_captured_ns"] = g["prev_captured_at"].astype("int64")
+    g["captured_ns"] = g["captured_at"].astype("int64")
+
+    prev_map = r.rename(columns={"log_time": "prev_log_time"})[
+        ["source_file", "device_uid", "captured_ns", "prev_log_time"]
+    ]
+    cur_map = r.rename(columns={"log_time": "event_log_time"})[
+        ["source_file", "device_uid", "captured_ns", "event_log_time"]
+    ]
+
+    out = g.merge(
+        prev_map,
+        left_on=["source_file", "device_uid", "prev_captured_ns"],
+        right_on=["source_file", "device_uid", "captured_ns"],
+        how="left",
+        suffixes=("", "_drop"),
+    )
+    out = out.drop(columns=[c for c in out.columns if c.endswith("_drop")], errors="ignore")
+    out = out.merge(
+        cur_map,
+        left_on=["source_file", "device_uid", "captured_ns"],
+        right_on=["source_file", "device_uid", "captured_ns"],
+        how="left",
+        suffixes=("", "_drop"),
+    )
+    out = out.drop(columns=[c for c in out.columns if c.endswith("_drop")], errors="ignore")
+
+    out["prev_time"] = pd.to_datetime(out["prev_log_time"], errors="coerce")
+    out["event_time"] = pd.to_datetime(out["event_log_time"], errors="coerce")
+    out["gap_ms_receiver"] = (out["event_time"] - out["prev_time"]).dt.total_seconds() * 1000.0
+    out["gap_ms_device"] = out["delta_ms"].astype(float)
+
+    return out[
+        [
+            "source_file",
+            "device_uid",
+            "prev_time",
+            "event_time",
+            "gap_ms_device",
+            "gap_ms_receiver",
+            "prev_captured_at",
+            "captured_at",
+        ]
+    ].sort_values(["source_file", "device_uid", "event_time"], kind="mergesort").reset_index(drop=True)
+
+
+def _get_active_segments(times_sec: np.ndarray, max_gap_sec: float) -> list:
+    """
+    Split a sorted array of epoch seconds into contiguous active segments.
+    Any gap > max_gap_sec between consecutive readings starts a new segment.
+    Returns list of (seg_start, seg_end) tuples in epoch seconds.
+    """
+    t = np.sort(times_sec[np.isfinite(times_sec)])
+    if t.size == 0:
+        return []
+    if t.size == 1:
+        return [(float(t[0]), float(t[0]))]
+    diffs = np.diff(t)
+    break_indices = np.where(diffs > max_gap_sec)[0]
+    starts = np.concatenate([[0], break_indices + 1])
+    ends = np.concatenate([break_indices, [len(t) - 1]])
+    return [(float(t[s]), float(t[e])) for s, e in zip(starts, ends)]
+
+
+def _datetime_to_epoch_seconds(s: pd.Series) -> np.ndarray:
+    dt = pd.to_datetime(s, errors="coerce")
+    ns = dt.astype("int64")
+    out = ns.to_numpy(dtype=np.float64) / 1_000_000_000.0
+    out[ns.to_numpy(dtype=np.int64) < 0] = np.nan
+    return out
+
+
+def _fit_schedule_from_times(times_sec: np.ndarray, nominal_period_ms: float, min_points: int) -> Optional[dict]:
+    t = np.asarray(times_sec, dtype=np.float64)
+    t = t[np.isfinite(t)]
+    if int(t.size) < int(min_points):
+        return None
+    t = np.sort(t)
+
+    dt_ms_full = np.diff(t) * 1000.0
+    dt_ms_valid = dt_ms_full[np.isfinite(dt_ms_full) & (dt_ms_full > 0)]
+    if int(dt_ms_valid.size) < 5:
+        return None
+
+    nom = float(nominal_period_ms)
+    near = dt_ms_valid[(dt_ms_valid >= 0.5 * nom) & (dt_ms_valid <= 1.5 * nom)]
+    if int(near.size) >= 20:
+        p0_ms = float(np.median(near))
+    else:
+        p0_ms = float(np.median(dt_ms_valid))
+    if not np.isfinite(p0_ms) or p0_ms <= 0:
+        return None
+
+    dt_for_steps = np.asarray(dt_ms_full, dtype=np.float64)
+    bad = ~np.isfinite(dt_for_steps) | (dt_for_steps <= 0)
+    if int(bad.sum()) > 0:
+        dt_for_steps[bad] = float(p0_ms)
+    steps = np.rint(dt_for_steps / p0_ms).astype(np.int64)
+    steps[steps < 1] = 1
+    steps = np.clip(steps, 1, 10_000)
+    k = np.empty(int(t.size), dtype=np.float64)
+    k[0] = 0.0
+    k[1:] = np.cumsum(steps, dtype=np.float64)
+
+    try:
+        slope, intercept = np.polyfit(k, t, deg=1)
+    except Exception:
+        return None
+    if not np.isfinite(slope) or not np.isfinite(intercept) or slope <= 0:
+        return None
+
+    return {"t0_sec": float(intercept), "p_sec": float(slope), "p_fit_ms": float(slope * 1000.0), "n_obs": int(t.size)}
+
+
+def run_collision_analysis_from_gaps(
+    readings_df: pd.DataFrame,
+    gaps_df: pd.DataFrame,
+    *,
+    out_dir: Path,
+    filter_tag: str,
+    dropout_threshold_ms: float,
+    dropout_max_gap_ms: float,
+    nominal_period_ms: float,
+    window_max_ms: int,
+    min_points_per_stream: int,
+    intra_gap_sec: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Collision analysis using ONLY the provided curated gaps_df as dropout ground truth.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Map curated gaps to receiver time intervals
+    mapped = map_gaps_to_log_time(gaps_df, readings_df)
+    if mapped.empty:
+        return {"filter_tag": filter_tag, "error": "No mapped gaps found."}
+
+    # Apply thresholds on curated gap size (device ms)
+    gdev = pd.to_numeric(mapped["gap_ms_device"], errors="coerce")
+    used = (gdev > float(dropout_threshold_ms)) & (
+        gdev <= float(dropout_max_gap_ms) if np.isfinite(dropout_max_gap_ms) else True
+    )
+    mapped["used_for_collision"] = used
+    mapped_csv = out_dir / f"{filter_tag}_dropout_events.csv"
+    mapped.to_csv(mapped_csv, index=False)
+
+    used_gaps = mapped[mapped["used_for_collision"]].copy()
+
+    # Fit schedules per (file,device) using receiver time log_time
+    params_rows: list[dict] = []
+    df = readings_df.copy()
+    df["log_time"] = pd.to_datetime(df.get("log_time"), errors="coerce")
+    df = df.dropna(subset=["source_file", "device_uid", "log_time"])
+    for (sf, dev), g in df.groupby(["source_file", "device_uid"], sort=True):
+        t_sec = _datetime_to_epoch_seconds(g["log_time"])
+        fit = _fit_schedule_from_times(t_sec, float(nominal_period_ms), int(min_points_per_stream))
+        if fit is None:
+            continue
+        params_rows.append({"source_file": sf, "device_uid": dev, **fit})
+    params = pd.DataFrame(params_rows)
+    params_csv = out_dir / f"{filter_tag}_collision_params.csv"
+    params.to_csv(params_csv, index=False)
+
+    if params.empty:
+        return {"filter_tag": filter_tag, "dropouts_csv": str(mapped_csv), "params_csv": str(params_csv), "error": "No schedules fitted."}
+
+    # Build active segments per (source_file, device_uid) — gaps > intra_gap_sec are session breaks
+    segments_dict: dict[tuple[str, str], list] = {}
+    for (sf, dev), g in df.groupby(["source_file", "device_uid"], sort=True):
+        t_sec = _datetime_to_epoch_seconds(g["log_time"])
+        segments_dict[(str(sf), str(dev))] = _get_active_segments(t_sec, intra_gap_sec)
+
+    # Generate ticks only within active segments, not across inter-session gaps
+    tick_rows: list[dict] = []
+    for _, r in params.iterrows():
+        t0 = float(r["t0_sec"])
+        p = float(r["p_sec"])
+        if not np.isfinite(t0) or not np.isfinite(p) or p <= 0:
+            continue
+        key = (str(r["source_file"]), str(r["device_uid"]))
+        segments = segments_dict.get(key, [])
+        for seg_start, seg_end in segments:
+            k_start = int(np.ceil((seg_start - t0) / p))
+            k_end = int(np.floor((seg_end - t0) / p))
+            if k_end < k_start:
+                continue
+            k = np.arange(k_start, k_end + 1, dtype=np.int64)
+            tick_sec = t0 + k.astype(np.float64) * p
+            tick_time = pd.to_datetime(tick_sec, unit="s", errors="coerce")
+            for ts_sec, ts_dt in zip(tick_sec, tick_time):
+                if pd.isna(ts_dt):
+                    continue
+                tick_rows.append({"source_file": r["source_file"], "device_uid": r["device_uid"], "tick_time": ts_dt, "tick_sec": float(ts_sec)})
+    ticks = pd.DataFrame(tick_rows).sort_values(["source_file", "tick_sec"], kind="mergesort").reset_index(drop=True)
+    if ticks.empty:
+        return {"filter_tag": filter_tag, "dropouts_csv": str(mapped_csv), "params_csv": str(params_csv), "error": "No ticks generated."}
+
+    # Build dropout intervals per (file,device) in epoch seconds (only used gaps)
+    intervals: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+    for (sf, dev), g in used_gaps.groupby(["source_file", "device_uid"], sort=False):
+        a = _datetime_to_epoch_seconds(g["prev_time"])
+        b = _datetime_to_epoch_seconds(g["event_time"])
+        ok = np.isfinite(a) & np.isfinite(b) & (b > a)
+        a = a[ok]
+        b = b[ok]
+        if a.size:
+            order = np.argsort(a)
+            intervals[(str(sf), str(dev))] = (a[order], b[order])
+
+    # Label ticks inside curated dropout intervals
+    y = np.zeros(int(len(ticks)), dtype=np.int64)
+    for (sf, dev), idx in ticks.groupby(["source_file", "device_uid"], sort=False).groups.items():
+        key = (str(sf), str(dev))
+        if key not in intervals:
+            continue
+        starts, ends = intervals[key]
+        t_sec = ticks.loc[idx, "tick_sec"].to_numpy(dtype=np.float64)
+        pos = np.searchsorted(starts, t_sec, side="right") - 1
+        m = (pos >= 0) & (t_sec > starts[pos]) & (t_sec < ends[pos])
+        y[idx] = m.astype(np.int64)
+    ticks["is_dropout_tick"] = y
+
+    # Compute min separation per tick within each file
+    ticks["min_sep_ms"] = np.nan
+    for sf, idx in ticks.groupby("source_file", sort=False).groups.items():
+        sidx = np.array(list(idx), dtype=np.int64)
+        order = np.argsort(ticks.loc[sidx, "tick_sec"].to_numpy(dtype=np.float64))
+        sidx_sorted = sidx[order]
+        ts = ticks.loc[sidx_sorted, "tick_sec"].to_numpy(dtype=np.float64)
+        if ts.size < 2:
+            ticks.loc[sidx_sorted, "min_sep_ms"] = np.inf
+            continue
+        prev = np.r_[np.inf, np.diff(ts)]
+        nxt = np.r_[np.diff(ts), np.inf]
+        ticks.loc[sidx_sorted, "min_sep_ms"] = np.minimum(prev, nxt) * 1000.0
+
+    # Choose best W by F1
+    y_true = ticks["is_dropout_tick"].to_numpy(dtype=np.int64)
+    ms = pd.to_numeric(ticks["min_sep_ms"], errors="coerce").to_numpy(dtype=np.float64)
+    best_w = 1
+    best_f1 = -1.0
+    for w in range(1, max(1, int(window_max_ms)) + 1):
+        y_pred = np.isfinite(ms) & (ms <= float(w))
+        tp = int(((y_true == 1) & y_pred).sum())
+        fp = int(((y_true == 0) & y_pred).sum())
+        fn = int(((y_true == 1) & (~y_pred)).sum())
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        if f1 > best_f1:
+            best_f1 = f1
+            best_w = int(w)
+
+    ticks_csv = out_dir / f"{filter_tag}_collision_ticks_W{best_w}ms.csv"
+    ticks.to_csv(ticks_csv, index=False)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "filter_tag": filter_tag,
+                "best_w_ms": int(best_w),
+                "n_curated_gaps": int(len(gaps_df)),
+                "n_used_gaps": int(len(used_gaps)),
+                "n_ticks": int(len(ticks)),
+                "n_dropout_ticks": int((ticks["is_dropout_tick"] == 1).sum()),
+            }
+        ]
+    )
+    summary_csv = out_dir / f"{filter_tag}_collision_validation_summary.csv"
+    summary.to_csv(summary_csv, index=False)
+
+    return {
+        "filter_tag": filter_tag,
+        "dropouts_csv": str(mapped_csv),
+        "params_csv": str(params_csv),
+        "ticks_csv": str(ticks_csv),
+        "summary_csv": str(summary_csv),
+        "best_w_ms": int(best_w),
+    }
+
+
 # --- Orchestration ---
 
 def setup_logging(level_str: str, log_file: Optional[Path]) -> logging.Logger:
@@ -861,6 +1305,48 @@ def setup_logging(level_str: str, log_file: Optional[Path]) -> logging.Logger:
     return logging.getLogger("eda")
 
 
+def load_or_parse_input_records(
+    parser_svc: LogParser,
+    *,
+    cache_path: Optional[Path],
+    rebuild_cache: bool,
+    logger: logging.Logger,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load parsed records from cache when available, otherwise parse raw text logs."""
+    if cache_path and cache_path.exists() and not rebuild_cache:
+        try:
+            grouped = ParsedBinaryStore.load(cache_path)
+            raw_readings, raw_temps, raw_events = ParsedBinaryStore.flatten_grouped(grouped)
+            logger.info(
+                "Loaded parsed cache: %s (devices=%d readings=%d temps=%d events=%d)",
+                cache_path,
+                len(grouped),
+                len(raw_readings),
+                len(raw_temps),
+                len(raw_events),
+            )
+            return raw_readings, raw_temps, raw_events
+        except Exception as exc:
+            logger.warning("Failed loading parsed cache '%s' (%s). Re-parsing txt logs.", cache_path, exc)
+
+    raw_readings, raw_temps, raw_events = parser_svc.parse()
+
+    if cache_path:
+        try:
+            grouped = ParsedBinaryStore.group_by_device(raw_readings, raw_temps, raw_events)
+            ParsedBinaryStore.save(
+                cache_path,
+                root=parser_svc.root,
+                pattern=parser_svc.pattern,
+                grouped=grouped,
+            )
+            logger.info("Saved parsed cache: %s (devices=%d)", cache_path, len(grouped))
+        except Exception as exc:
+            logger.warning("Failed saving parsed cache '%s' (%s). Continuing without cache.", cache_path, exc)
+
+    return raw_readings, raw_temps, raw_events
+
+
 def main() -> int:
     # 1. Configuration
     p = argparse.ArgumentParser(description="EDA Refactored")
@@ -870,7 +1356,7 @@ def main() -> int:
     # Below is a minimal hydration for context:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".")
-    parser.add_argument("--pattern", default="**/*.txt")
+    parser.add_argument("--pattern", default="rdc-captures/*.txt")
     parser.add_argument("--filter-date", default="all")
     parser.add_argument("--export-dir", default="session_exports")
     parser.add_argument("--plots-dir", default="plots")
@@ -885,7 +1371,23 @@ def main() -> int:
     parser.add_argument("--temp-bin-test-alpha", type=float, default=0.05)
     parser.add_argument("--temp-bin-test-min-samples", type=int, default=200)
     parser.add_argument("--temp-bin-test-permutations", type=int, default=2000)
-    
+    parser.add_argument("--real-gaps-dir", default="real-gaps")
+    parser.add_argument("--use-real-gaps", action="store_true", default=True)
+    parser.add_argument("--real-gaps-max-ms", type=float, default=10000.0)
+    parser.add_argument("--collision-analysis", action="store_true", default=True)
+    parser.add_argument("--collision-out-dir", default="collision_exports")
+    parser.add_argument("--collision-window-max-ms", type=int, default=50)
+    parser.add_argument("--collision-nominal-period-ms", type=float, default=200.0)
+    parser.add_argument("--collision-min-points-per-stream", type=int, default=200)
+    parser.add_argument("--collision-intra-gap-ms", type=float, default=1000.0,
+                        help="Max gap (ms) between readings before treating as a new session. Ticks are not generated across larger gaps. Default: 1000.")
+    parser.add_argument("--parsed-binary-path", default="parsed_cache/parsed_by_device.pkl.gz",
+                        help="Compressed binary cache (grouped by device serial) used to speed ingestion.")
+    parser.add_argument("--rebuild-parsed-binary", action="store_true", default=False,
+                        help="Ignore existing parsed binary cache and rebuild from txt files.")
+    parser.add_argument("--build-parsed-binary-only", action="store_true", default=False,
+                        help="Parse txt files and write parsed binary cache, then exit.")
+
     args = parser.parse_args()
     config = AppConfig.from_args(args)
     logger = setup_logging(config.log_level, config.log_file)
@@ -894,7 +1396,23 @@ def main() -> int:
 
     # 2. Ingestion
     parser_svc = LogParser(config.root, config.pattern)
-    raw_readings, raw_temps, raw_events = parser_svc.parse()
+    cache_arg = str(getattr(args, "parsed_binary_path", "")).strip()
+    cache_path: Optional[Path] = None
+    if cache_arg and cache_arg.lower() not in {"none", "off", "false"}:
+        cache_path = Path(cache_arg)
+        if not cache_path.is_absolute():
+            cache_path = (Path.cwd() / cache_path).resolve()
+
+    raw_readings, raw_temps, raw_events = load_or_parse_input_records(
+        parser_svc,
+        cache_path=cache_path,
+        rebuild_cache=bool(getattr(args, "rebuild_parsed_binary", False)),
+        logger=logger,
+    )
+
+    if bool(getattr(args, "build_parsed_binary_only", False)):
+        logger.info("Built parsed binary cache only. Exiting.")
+        return 0
 
     # 3. Processing
     processor = DataProcessor(logger)
@@ -912,6 +1430,42 @@ def main() -> int:
     if not gaps_df.empty:
         max_gap = gaps_df["delta_ms"].max()
         logger.warning("Detected %d gaps > %.1fms (Max: %.1fms)", len(gaps_df), config.gap_threshold_ms, max_gap)
+
+    # Optional curated gap override
+    if getattr(args, "use_real_gaps", False):
+        rg_dir = Path(getattr(args, "real_gaps_dir", "real-gaps"))
+        real_gaps = load_real_gaps(rg_dir)
+        if real_gaps.empty:
+            logger.warning("--use-real-gaps: no usable CSVs found in %s", rg_dir)
+        else:
+            keep_files = set(analysis_df["source_file"].astype(str).unique())
+            keep_devs  = set(analysis_df["device_uid"].astype(str).unique())
+            real_gaps  = real_gaps[
+                real_gaps["source_file"].astype(str).isin(keep_files)
+                & real_gaps["device_uid"].astype(str).isin(keep_devs)
+            ].copy()
+            max_ms = float(getattr(args, "real_gaps_max_ms", 10000.0))
+            real_gaps = real_gaps[pd.to_numeric(real_gaps["delta_ms"], errors="coerce") <= max_ms].copy()
+            gaps_df = real_gaps.reset_index(drop=True)
+
+    # Collision analysis
+    if getattr(args, "collision_analysis", False):
+        out_dir = Path(getattr(args, "collision_out_dir", "collision_exports"))
+        if gaps_df.empty:
+            logger.warning("--collision-analysis: gaps_df is empty, nothing to process.")
+        else:
+            info = run_collision_analysis_from_gaps(
+                analysis_df, gaps_df,
+                out_dir=out_dir,
+                filter_tag=filter_tag,
+                dropout_threshold_ms=float(config.gap_threshold_ms),
+                dropout_max_gap_ms=float(getattr(args, "real_gaps_max_ms", 10000.0)),
+                nominal_period_ms=float(getattr(args, "collision_nominal_period_ms", 200.0)),
+                window_max_ms=int(getattr(args, "collision_window_max_ms", 50)),
+                min_points_per_stream=int(getattr(args, "collision_min_points_per_stream", 200)),
+                intra_gap_sec=float(getattr(args, "collision_intra_gap_ms", 1000.0)) / 1000.0,
+            )
+            logger.info("Collision analysis outputs: %s", info)
 
     # Export
     exporter = ResultsExporter(config.export_dir, logger)
